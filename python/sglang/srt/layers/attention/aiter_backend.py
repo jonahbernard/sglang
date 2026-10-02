@@ -1592,6 +1592,37 @@ class AiterAttnBackend(AttentionBackend):
             return 1
         return kv_indices_num_token_blocks(self.req_to_token.shape[1], bs)
 
+    def _fill_kv_indices(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        kv_lens: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+    ) -> None:
+        if self.kv_index_translator.reads_are_translated:
+            self.kv_index_translator.fill_packed_read_stream(
+                req_pool_indices=req_pool_indices,
+                seq_lens=kv_lens,
+                indptr=kv_indptr,
+                total_tokens=kv_indices.numel(),
+                out=kv_indices,
+            )
+            return
+        # The translator's plain gather has no token-block split.
+        bs = kv_lens.numel()
+        num_token_blocks = self._kv_index_blocks(bs)
+        create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
+            self.req_to_token,
+            req_pool_indices,
+            kv_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
+        )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1821,27 +1852,12 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_sum, device
                 )
 
-                if self.kv_index_translator.reads_are_translated:
-                    self.kv_index_translator.fill_packed_read_stream(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        seq_lens=forward_batch.seq_lens,
-                        indptr=kv_indptr,
-                        total_tokens=kv_indices.numel(),
-                        out=kv_indices,
-                    )
-                else:
-                    # The translator's plain gather has no token-block split.
-                    num_token_blocks = self._kv_index_blocks(bs)
-                    create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        kv_indptr,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                        TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
-                    )
+                self._fill_kv_indices(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    kv_lens=forward_batch.seq_lens,
+                    kv_indptr=kv_indptr,
+                    kv_indices=kv_indices,
+                )
 
                 if _use_mla_ps_kernel:
                     max_seqlen_qo = num_draft_tokens
@@ -1930,16 +1946,11 @@ class AiterAttnBackend(AttentionBackend):
                     kv_lens_sum,
                     device,
                 )
-                num_token_blocks = self._kv_index_blocks(bs)
-                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    kv_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
+                self._fill_kv_indices(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    kv_lens=kv_lens,
+                    kv_indptr=kv_indptr,
+                    kv_indices=kv_indices,
                 )
 
                 if self.dcp_world_size > 1:
@@ -2701,16 +2712,11 @@ class AiterAttnBackend(AttentionBackend):
                     bs=bs,
                     seq_lens_sum=seq_lens_sum,
                 )
-            num_token_blocks = self._kv_index_blocks(bs)
-            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
-                self.req_to_token,
-                req_pool_indices,
-                kv_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
+            self._fill_kv_indices(
+                req_pool_indices=req_pool_indices,
+                kv_lens=kv_lens,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
             )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 

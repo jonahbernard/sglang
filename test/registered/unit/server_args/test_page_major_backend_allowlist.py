@@ -95,13 +95,14 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
         "cutedsl_mla",
         "tokenspeed_mla",
         "flashmla",
+        "aiter",
     )
     # Wired for the per-layer MHA/SWA views.
     PER_LAYER_VIEW_MHA_BACKENDS = ("fa3", "fa4", "flashinfer", "trtllm_mha")
     # MLA-family kernels that must never leak into the MHA arm.
     MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla")
-    # No virtual-to-physical id wiring anywhere: must stay rejected until they get one.
-    UNWIRED_BACKENDS = ("aiter",)
+    # Virtual-to-physical id wiring on the MLA paths only: must stay out of the MHA arm.
+    MHA_UNWIRED_BACKENDS = ("aiter",)
 
     def test_triton_allowed_on_every_arm(self):
         """Triton reads both view families, so it is the one backend neither
@@ -165,13 +166,12 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                     f"{backend} must stay rejected without --enable-unified-memory",
                 )
 
-    def test_unwired_backends_always_rejected(self):
-        for backend in self.UNWIRED_BACKENDS:
-            for use_mla in (True, False):
-                self.assertFalse(
-                    _accepts(backend, use_mla=use_mla),
-                    f"{backend} has no virtual-to-physical id wiring and must be rejected",
-                )
+    def test_mha_unwired_backends_rejected_for_mha(self):
+        for backend in self.MHA_UNWIRED_BACKENDS:
+            self.assertFalse(
+                _accepts(backend, use_mla=False),
+                f"{backend} has no MHA virtual-to-physical id wiring and must be rejected",
+            )
 
     def test_helion_linear_attention_is_kda_only(self):
         for phase in ("decode", "prefill"):

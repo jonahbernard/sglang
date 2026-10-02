@@ -557,7 +557,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         )
         # Both roles: verify routes to either backend depending on
         # --speculative-attention-mode.
-        spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+        spec_allowed = {
+            "triton",
+            "trtllm_mla",
+            "cutedsl_mla",
+            "tokenspeed_mla",
+            "aiter",
+        }
         spec_backends = set(attention_backends_of(resolved_view(server_args)))
         spec_backends.discard(None)
         assert spec_backends <= spec_allowed, (
@@ -721,7 +727,7 @@ def handle_page_major_kv_layout(server_args: Any):
             "cutedsl_mla",
             "tokenspeed_mla",
             "flashmla",
-            "aiter",  # WIP: speculative index builders still read virtual ids.
+            "aiter",
         }
     else:
         allowed_full = {
