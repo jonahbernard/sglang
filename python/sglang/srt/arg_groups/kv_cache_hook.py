@@ -721,6 +721,7 @@ def handle_page_major_kv_layout(server_args: Any):
             "cutedsl_mla",
             "tokenspeed_mla",
             "flashmla",
+            "aiter",  # WIP: speculative index builders still read virtual ids.
         }
     else:
         allowed_full = {
