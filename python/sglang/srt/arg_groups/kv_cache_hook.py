@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -722,8 +723,8 @@ def handle_page_major_kv_layout(server_args: Any):
     # their strides (the slot stride is the whole entry, not one row):
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
     #     snap).
-    #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
-    #     Triton. fa4 is the fa3 class.
+    #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha / aiter
+    #     alongside Triton. fa4 is the fa3 class.
     # Names are the RESOLVED ids from attention_backends_of.
     if use_mla_backend(server_args):
         allowed_full = {
@@ -743,6 +744,7 @@ def handle_page_major_kv_layout(server_args: Any):
             "fa4",
             "flashinfer",
             "trtllm_mha",
+            "aiter",
         }
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
@@ -752,6 +754,15 @@ def handle_page_major_kv_layout(server_args: Any):
         f"{sorted(allowed_full)} for this configuration (unified memory "
         "allows the stride-aware per-layer-view families). Pass a "
         "compatible --attention-backend."
+    )
+    # aiter's EXPERIMENTAL pa_ragged truncates the KV element offset to 32 bits.
+    assert not (
+        "aiter" in backends
+        and not use_mla_backend(server_args)
+        and os.getenv("QKV_VERSION", "GOLDEN") == "EXPERIMENTAL"
+    ), (
+        "--enable-unified-memory does not support aiter's QKV_VERSION="
+        "EXPERIMENTAL paged attention (32-bit KV offsets); unset QKV_VERSION."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):

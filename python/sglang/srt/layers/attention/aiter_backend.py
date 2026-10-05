@@ -10,7 +10,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import triton
@@ -996,7 +996,6 @@ class AiterAttnBackend(AttentionBackend):
         page_size = self.page_size
         max_blocks = (self.max_context_len + page_size - 1) // page_size
 
-        swa_slot_mapping = None
         swa_page_table = None
 
         if page_table_dest is not None:
@@ -1005,8 +1004,6 @@ class AiterAttnBackend(AttentionBackend):
             page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
 
         if self.use_sliding_window_kv_pool:
-            swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
-
             if swa_page_table_dest is not None:
                 swa_page_table = swa_page_table_dest
             else:
@@ -1014,21 +1011,12 @@ class AiterAttnBackend(AttentionBackend):
                     bs, max_blocks, dtype=torch.int32, device=device
                 )
 
-        BLOCK_SIZE = 1024
-        grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
-        scatter_req_to_token_to_page_table_kernel[grid](
-            self.req_to_token,
-            req_pool_indices,
-            seq_lens,
-            page_table,
-            self.req_to_token.stride(0),
-            page_table.stride(0),
-            swa_page_table,
-            swa_slot_mapping,
-            DRAFT_NUM=draft_num,
-            PAGE_SIZE=page_size,
-            BLOCK_SIZE=BLOCK_SIZE,
-            HAS_SWA=(swa_slot_mapping is not None),
+        self._fill_unified_page_tables(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            draft_num=draft_num,
+            page_table=page_table,
+            swa_page_table=swa_page_table,
         )
 
         return page_table, qo_indptr, draft_num, swa_page_table
@@ -1050,16 +1038,49 @@ class AiterAttnBackend(AttentionBackend):
 
         page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
 
-        swa_slot_mapping = None
         swa_page_table = None
         if self.use_sliding_window_kv_pool:
-            swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
             swa_page_table = torch.zeros(
                 bs, max_blocks, dtype=torch.int32, device=device
             )
 
+        self._fill_unified_page_tables(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            draft_num=0,
+            page_table=page_table,
+            swa_page_table=swa_page_table,
+        )
+        return page_table, swa_page_table
+
+    def _fill_unified_page_tables(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        draft_num: int,
+        page_table: torch.Tensor,
+        swa_page_table: Optional[torch.Tensor],
+    ) -> None:
+        """Fill unified_attention's block tables over each row's first
+        `seq_lens + draft_num` tokens; the tail past that is left untouched."""
+        if self.kv_index_translator.reads_are_translated:
+            self.kv_index_translator.fill_read_table(
+                out=page_table,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens + draft_num if draft_num else seq_lens,
+                sliding_window_out=swa_page_table,
+            )
+            return
+
+        swa_slot_mapping = (
+            self.swa_kv_pool.full_to_swa_index_mapping.long()
+            if swa_page_table is not None
+            else None
+        )
+        max_blocks = page_table.shape[1]
         BLOCK_SIZE = 1024
-        grid = (bs, triton.cdiv(max_blocks, BLOCK_SIZE))
+        grid = (req_pool_indices.numel(), triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
         scatter_req_to_token_to_page_table_kernel[grid](
             self.req_to_token,
             req_pool_indices,
@@ -1069,12 +1090,11 @@ class AiterAttnBackend(AttentionBackend):
             page_table.stride(0),
             swa_page_table,
             swa_slot_mapping,
-            DRAFT_NUM=0,
-            PAGE_SIZE=page_size,
+            DRAFT_NUM=draft_num,
+            PAGE_SIZE=self.page_size,
             BLOCK_SIZE=BLOCK_SIZE,
             HAS_SWA=(swa_slot_mapping is not None),
         )
-        return page_table, swa_page_table
 
     def _forward_extend_unified(
         self,
@@ -1683,6 +1703,91 @@ class AiterAttnBackend(AttentionBackend):
             TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
         )
 
+    def _build_unified_decode_page_tables(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_kv_len: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        bs = seq_lens.numel()
+        if self.kv_index_translator.reads_are_translated:
+            max_blocks = -(-max_kv_len // self.page_size)
+            page_table = torch.zeros(
+                bs, max_blocks, dtype=torch.int32, device=self.device
+            )
+            swa_page_table = (
+                torch.zeros_like(page_table)
+                if self.use_sliding_window_kv_pool
+                else None
+            )
+            self.kv_index_translator.fill_read_table(
+                out=page_table,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                sliding_window_out=swa_page_table,
+            )
+            return page_table, swa_page_table
+
+        kv_indices = torch.zeros(bs, max_kv_len, dtype=torch.int32, device=self.device)
+        create_flashmla_kv_indices_triton[
+            (bs, get_num_kv_index_blocks_flashmla(max_kv_len, 1))
+        ](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+            max_kv_len,
+            1,
+        )
+
+        swa_page_table = None
+        if self.use_sliding_window_kv_pool:
+            # AITER attention kernels require int32 page indices;
+            # full_to_swa_index_mapping is stored as int64.
+            swa_page_table = self.swa_kv_pool.translate_loc_from_full_to_swa(
+                kv_indices
+            ).to(torch.int32)
+            swa_page_table = self._transform_table_1_to_real(swa_page_table)
+        return self._transform_table_1_to_real(kv_indices), swa_page_table
+
+    def _sliding_window_prefill_indices(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+    ) -> torch.Tensor:
+        full_indices = self.indices_updater_prefill.kv_indices
+        if not self.kv_index_translator.reads_are_translated:
+            # AITER attention kernels (e.g. mha_batch_prefill_func) require
+            # int32 page indices; full_to_swa_index_mapping is stored as int64.
+            return self.swa_kv_pool.translate_loc_from_full_to_swa(full_indices).to(
+                torch.int32
+            )
+        # The full stream is already physical, so gather the swa stream from the
+        # virtual table instead; pad its tail like the full one.
+        swa_indices = torch.empty_like(full_indices)
+        self.kv_index_translator.fill_packed_read_stream(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            indptr=self.indices_updater_prefill.kv_indptr,
+            total_tokens=seq_lens_sum,
+            out=swa_indices,
+            sliding_window=True,
+        )
+        swa_indices[seq_lens_sum:] = swa_indices[0]
+        return swa_indices
+
+    def _sliding_window_write_loc(self, out_cache_loc: torch.Tensor) -> torch.Tensor:
+        # A unified write loc is already full-physical, while the pool's
+        # full->swa map takes virtual ids.
+        if self.kv_index_translator.is_translating:
+            return self.kv_index_translator.sliding_window_write_loc_for(out_cache_loc)
+        return self.swa_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1717,9 +1822,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.swa_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
+                    self._sliding_window_write_loc(forward_batch.out_cache_loc)
                 )
             self.forward_metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                 :n
@@ -1748,7 +1851,7 @@ class AiterAttnBackend(AttentionBackend):
         swa_page_table = None
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.swa_kv_pool.translate_loc_from_full_to_swa(
+            swa_out_cache_loc = self._sliding_window_write_loc(
                 forward_batch.out_cache_loc
             )
         max_kv_len = forward_batch.seq_lens_cpu.max().item()
@@ -1788,39 +1891,11 @@ class AiterAttnBackend(AttentionBackend):
                         )
                 else:
                     max_q_len = 1
-                    page_size = self.page_size
-                    max_num_blocks_per_seq = (max_kv_len + page_size - 1) // page_size
-                    kv_indices = torch.zeros(
-                        bs, max_kv_len, dtype=torch.int32, device=self.device
+                    kv_indices, swa_page_table = self._build_unified_decode_page_tables(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        seq_lens=forward_batch.seq_lens,
+                        max_kv_len=max_kv_len,
                     )
-
-                    create_flashmla_kv_indices_triton[
-                        (bs, get_num_kv_index_blocks_flashmla(max_kv_len, 1))
-                    ](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                        max_kv_len,
-                        1,
-                    )
-
-                    if self.use_sliding_window_kv_pool:
-                        # AITER attention kernels require int32 page indices;
-                        # full_to_swa_index_mapping is stored as int64.
-                        swa_page_table = (
-                            self.swa_kv_pool.translate_loc_from_full_to_swa(
-                                kv_indices
-                            ).to(torch.int32)
-                        )
-
-                        kv_indices = self._transform_table_1_to_real(kv_indices)
-                        swa_page_table = self._transform_table_1_to_real(swa_page_table)
-                    elif self.page_size > 1:
-                        kv_indices = self._transform_table_1_to_real(kv_indices)
-
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
             else:
@@ -2120,16 +2195,11 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices = torch.empty(
                         kv_indptr[-1], dtype=torch.int64, device=self.device
                     )
-                    num_token_blocks = self._kv_index_blocks(bs)
-                    create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        kv_indptr,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                        TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
+                    self._fill_kv_indices(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        kv_lens=forward_batch.seq_lens,
+                        kv_indptr=kv_indptr,
+                        kv_indices=kv_indices,
                     )
 
                     custom_mask = spec_info.custom_mask
@@ -2208,12 +2278,11 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 if self.use_sliding_window_kv_pool:
-                    # AITER attention kernels (e.g. mha_batch_prefill_func)
-                    # require int32 page indices; full_to_swa_index_mapping is
-                    # stored as int64.
-                    swa_page_table = self.swa_kv_pool.translate_loc_from_full_to_swa(
-                        self.indices_updater_prefill.kv_indices
-                    ).to(torch.int32)
+                    swa_page_table = self._sliding_window_prefill_indices(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        seq_lens=forward_batch.seq_lens,
+                        seq_lens_sum=forward_batch.seq_lens_sum,
+                    )
 
                 # Once per batch, not per layer: forward_extend only consumes it.
                 # The arch test is not redundant with the flag: the asm guard is
@@ -2227,6 +2296,9 @@ class AiterAttnBackend(AttentionBackend):
                     and not self.kv_cache_is_vectorized_5d
                     and not self.use_sliding_window_kv_pool
                     and not self.use_triton_unified_attention
+                    # Not verified on strided unified views past 4 GiB;
+                    # the token-level CK prefill is.
+                    and not self.kv_index_translator.is_translating
                 ):
                     paged_kv_view = _build_paged_kv_view(
                         self.indices_updater_prefill.kv_indices,
@@ -2607,6 +2679,17 @@ class AiterAttnBackend(AttentionBackend):
                             dest_buf=kv_indices,
                             swa_dest_buf=swa_page_table,
                         )
+                    elif self.kv_index_translator.reads_are_translated:
+                        self.kv_index_translator.fill_read_table(
+                            out=kv_indices[:bs],
+                            req_pool_indices=req_pool_indices[:bs],
+                            seq_lens=seq_lens[:bs],
+                            sliding_window_out=(
+                                swa_page_table[:bs]
+                                if swa_page_table is not None
+                                else None
+                            ),
+                        )
                     else:
                         page_indices = self.req_to_token[
                             req_pool_indices[:bs], :max_kv_len
@@ -2856,10 +2939,14 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table=_swa_page_table,
                     )
                 else:
-                    custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    # A linear draft (DSPARK) verifies causally and sends no mask.
+                    if spec_info.custom_mask is not None:
+                        custom_mask = self.cuda_graph_custom_mask
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
+                    else:
+                        custom_mask = None
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -2889,16 +2976,11 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
-            num_token_blocks = self._kv_index_blocks(bs)
-            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
+            self._fill_kv_indices(
+                req_pool_indices=req_pool_indices,
+                kv_lens=seq_lens,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
             )
 
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
@@ -2969,7 +3051,13 @@ class AiterAttnBackend(AttentionBackend):
             and not self.use_sliding_window_kv_pool
             and layer.tp_k_head_num == layer.tp_v_head_num
             and layer.qk_head_dim == layer.v_head_dim
+            and self._use_reshape_and_cache_flash()
         )
+
+    def _use_reshape_and_cache_flash(self) -> bool:
+        # reshape_and_cache_flash assumes a dense page (token stride H * D);
+        # a unified pool's views stride each token by the whole layer entry.
+        return not self.kv_index_translator.is_translating
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
@@ -3280,6 +3368,7 @@ class AiterAttnBackend(AttentionBackend):
                 elif (
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
+                    and self._use_reshape_and_cache_flash()
                 ):
                     token_to_kv_pool = self.token_to_kv_pool
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
@@ -4232,7 +4321,11 @@ class AiterAttnBackend(AttentionBackend):
             # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
             # use standard set_kv_buffer, as they lack SWA-specific attributes
             # like full_to_swa_index_mapping.
-            elif self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
+            elif (
+                self.use_triton_unified_attention
+                and self.use_sliding_window_kv_pool
+                and self._use_reshape_and_cache_flash()
+            ):
                 token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
@@ -4493,14 +4586,13 @@ class AiterIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
+            self.attn_backend.kv_index_translator.fill_packed_read_stream(
+                req_pool_indices=req_pool_indices,
+                seq_lens=paged_kernel_lens,
+                indptr=kv_indptr,
+                total_tokens=paged_kernel_lens_sum,
+                out=kv_indices,
+                kv_start_idx=kv_start_idx,
             )
 
             token_num = kv_indptr[-1]

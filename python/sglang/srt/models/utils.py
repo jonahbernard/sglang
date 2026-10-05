@@ -34,6 +34,7 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -300,7 +301,13 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         and not isinstance(pool, SWAKVPool)
         and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-    ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
+    ) or (
+        _is_hip
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+        # The fused store has no unified full->swa slot table; set_kv_buffer
+        # takes the backend's per-batch swa write loc instead.
+        and not isinstance(pool, UnifiedSWAKVPool)
+    )
 
 
 def create_fused_set_kv_buffer_arg(

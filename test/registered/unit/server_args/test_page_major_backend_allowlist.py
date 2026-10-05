@@ -36,6 +36,7 @@ import msgspec
 from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -98,11 +99,9 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
         "aiter",
     )
     # Wired for the per-layer MHA/SWA views.
-    PER_LAYER_VIEW_MHA_BACKENDS = ("fa3", "fa4", "flashinfer", "trtllm_mha")
+    PER_LAYER_VIEW_MHA_BACKENDS = ("fa3", "fa4", "flashinfer", "trtllm_mha", "aiter")
     # MLA-family kernels that must never leak into the MHA arm.
     MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla")
-    # Virtual-to-physical id wiring on the MLA paths only: must stay out of the MHA arm.
-    MHA_UNWIRED_BACKENDS = ("aiter",)
 
     def test_triton_allowed_on_every_arm(self):
         """Triton reads both view families, so it is the one backend neither
@@ -166,12 +165,14 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                     f"{backend} must stay rejected without --enable-unified-memory",
                 )
 
-    def test_mha_unwired_backends_rejected_for_mha(self):
-        for backend in self.MHA_UNWIRED_BACKENDS:
-            self.assertFalse(
-                _accepts(backend, use_mla=False),
-                f"{backend} has no MHA virtual-to-physical id wiring and must be rejected",
-            )
+    def test_aiter_mha_rejects_32bit_offset_pa_ragged(self):
+        """aiter's EXPERIMENTAL pa_ragged truncates KV offsets to 32 bits, so it
+        may not run on the unified views; MLA never reaches it."""
+        with temp_set_env(QKV_VERSION="EXPERIMENTAL"):
+            self.assertFalse(_accepts("aiter", use_mla=False))
+            self.assertTrue(_accepts("aiter", use_mla=True))
+        with temp_set_env(QKV_VERSION="GOLDEN"):
+            self.assertTrue(_accepts("aiter", use_mla=False))
 
     def test_helion_linear_attention_is_kda_only(self):
         for phase in ("decode", "prefill"):
