@@ -36,7 +36,10 @@ from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec
@@ -304,10 +307,24 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     ) or (
         _is_hip
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-        # The fused store has no unified full->swa slot table; set_kv_buffer
-        # takes the backend's per-batch swa write loc instead.
-        and not isinstance(pool, UnifiedSWAKVPool)
+        # The unified SWA pool has no full->swa slot table, so its SWA layers
+        # need the backend's per-batch swa write loc.
+        and (
+            not isinstance(pool, UnifiedSWAKVPool)
+            or _unified_swa_write_loc() is not None
+        )
     )
+
+
+def _unified_swa_write_loc() -> Optional[torch.Tensor]:
+    """The aiter backend's per-batch swa write loc, or None when the active
+    backend does not build one."""
+    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+    backend = get_attn_backend()
+    if not isinstance(backend, AiterAttnBackend):
+        return None
+    return backend.forward_metadata.swa_out_cache_loc
 
 
 def create_fused_set_kv_buffer_arg(
@@ -347,6 +364,12 @@ def create_fused_set_kv_buffer_arg(
             if layer.sliding_window_size > 0 and full_to_swa is not None
             else None
         )
+        slot_mapping = forward_batch.out_cache_loc
+        if isinstance(token_to_kv_pool, UnifiedSWAKVPool):
+            # This store bypasses the pool's physical-loc check on set_kv_buffer.
+            assert forward_batch.out_cache_loc_is_physical
+            if token_to_kv_pool.layers_mapping[layer_id][1]:
+                slot_mapping = _unified_swa_write_loc()[: slot_mapping.shape[0]]
         # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
         # fused_qk_rope_reshape_and_cache via flash_layout=False. For the
         # legacy NHD 3D pool we reshape to the (num_blocks, page_size, H, D)
@@ -367,7 +390,7 @@ def create_fused_set_kv_buffer_arg(
             "v_scale": layer.v_scale,
             "key_cache": key_cache,
             "value_cache": value_cache,
-            "slot_mapping": forward_batch.out_cache_loc,
+            "slot_mapping": slot_mapping,
             "swa_slot_mapping": slot_mapping_swa,
         }
 
