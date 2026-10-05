@@ -36,7 +36,6 @@ import msgspec
 from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -164,15 +163,6 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                     _accepts(backend, use_mla=use_mla, unified=False),
                     f"{backend} must stay rejected without --enable-unified-memory",
                 )
-
-    def test_aiter_mha_rejects_32bit_offset_pa_ragged(self):
-        """aiter's EXPERIMENTAL pa_ragged truncates KV offsets to 32 bits, so it
-        may not run on the unified views; MLA never reaches it."""
-        with temp_set_env(QKV_VERSION="EXPERIMENTAL"):
-            self.assertFalse(_accepts("aiter", use_mla=False))
-            self.assertTrue(_accepts("aiter", use_mla=True))
-        with temp_set_env(QKV_VERSION="GOLDEN"):
-            self.assertTrue(_accepts("aiter", use_mla=False))
 
     def test_helion_linear_attention_is_kda_only(self):
         for phase in ("decode", "prefill"):

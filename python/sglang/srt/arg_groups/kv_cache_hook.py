@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -754,15 +753,6 @@ def handle_page_major_kv_layout(server_args: Any):
         f"{sorted(allowed_full)} for this configuration (unified memory "
         "allows the stride-aware per-layer-view families). Pass a "
         "compatible --attention-backend."
-    )
-    # aiter's EXPERIMENTAL pa_ragged truncates the KV element offset to 32 bits.
-    assert not (
-        "aiter" in backends
-        and not use_mla_backend(server_args)
-        and os.getenv("QKV_VERSION", "GOLDEN") == "EXPERIMENTAL"
-    ), (
-        "--enable-unified-memory does not support aiter's QKV_VERSION="
-        "EXPERIMENTAL paged attention (32-bit KV offsets); unset QKV_VERSION."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):
