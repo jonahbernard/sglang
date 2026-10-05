@@ -82,12 +82,10 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
 
         x = GTensor(x_mem, dtype=T.bf16, shape=(-1,))
         weight = GTensor(weight_mem, dtype=T.f32, shape=(-1,))
-        conv_state = GTensor(conv_state_mem, dtype=T.bf16, shape=(-1,))
         raw_g = GTensor(raw_g_mem, dtype=T.bf16, shape=(-1,))
         raw_beta = GTensor(raw_beta_mem, dtype=T.bf16, shape=(-1,))
         A_log = GTensor(A_log_mem, dtype=T.f32, shape=(-1,))
         dt_bias = GTensor(dt_bias_mem, dtype=T.f32, shape=(-1,))
-        state = GTensor(state_mem, dtype=T.f32, shape=(-1,))
         state_indices = GTensor(state_indices_mem, dtype=T.i32, shape=(-1,))
         output_gate = GTensor(output_gate_mem, dtype=T.bf16, shape=(-1,))
         norm_weight = GTensor(norm_weight_mem, dtype=T.bf16, shape=(-1,))
@@ -110,6 +108,21 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
 
         state_idx = fx.Int32(state_indices[batch])
         valid = state_idx > fx.Int32(0)
+        # Slot offsets exceed the 32-bit buffer voffset in the unified pool, so
+        # each slot is folded into the 64-bit descriptor base instead.
+        slot = fx.Int64(fx.rocdl.readfirstlane(T.i32, state_idx))
+        conv_state = GTensor(
+            conv_state_mem,
+            dtype=T.bf16,
+            shape=(-1,),
+            static_bytes_offset_i64=slot * fx.Int64(stride_conv_slot) * fx.Int64(2),
+        )
+        state = GTensor(
+            state_mem,
+            dtype=T.f32,
+            shape=(-1,),
+            static_bytes_offset_i64=slot * fx.Int64(stride_state_slot) * fx.Int64(4),
+        )
 
         valid_if = scf.IfOp(_to_raw(valid), results_=[], has_else=True)
         with ir.InsertionPoint(valid_if.then_block):
@@ -131,9 +144,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                 )
 
                 def convolve_channel(channel):
-                    cs_base = (
-                        state_idx * stride_conv_slot + channel * stride_conv_channel
-                    )
+                    cs_base = channel * stride_conv_channel
                     c0 = fx.Float32(conv_state[cs_base])
                     c1 = fx.Float32(conv_state[cs_base + stride_conv_width])
                     c2 = fx.Float32(
@@ -316,9 +327,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
             beta = fx.Float32(1.0) / (
                 fx.Float32(1.0) + fx.math.exp2(-beta_value * fx.Float32(_LOG2E))
             )
-            state_head_base = state_idx * stride_state_slot + head * fx.Int32(
-                _DIM * _DIM
-            )
+            state_head_base = head * fx.Int32(_DIM * _DIM)
 
             state_vecs = []
             for vi in range_constexpr(_V_ITERS):
