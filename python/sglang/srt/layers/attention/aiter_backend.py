@@ -2055,6 +2055,7 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     forward_batch.spec_info.num_tokens_per_req,
                     max_kv_len,
+                    swa_out_cache_loc=swa_out_cache_loc,
                 )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
@@ -2218,6 +2219,7 @@ class AiterAttnBackend(AttentionBackend):
                         custom_mask=custom_mask,
                         mask_indptr=mask_indptr,
                         max_extend_len=draft_num,
+                        swa_out_cache_loc=swa_out_cache_loc,
                     )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
