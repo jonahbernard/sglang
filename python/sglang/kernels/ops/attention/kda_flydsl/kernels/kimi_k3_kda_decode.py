@@ -8,7 +8,12 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _to_raw
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    GTensor,
+    _to_raw,
+    buf_scalar_load,
+    ptr_buf_tensor,
+)
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import gpu as mlir_gpu
 from flydsl._mlir.dialects import scf
@@ -86,7 +91,6 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
         raw_beta = GTensor(raw_beta_mem, dtype=T.bf16, shape=(-1,))
         A_log = GTensor(A_log_mem, dtype=T.f32, shape=(-1,))
         dt_bias = GTensor(dt_bias_mem, dtype=T.f32, shape=(-1,))
-        state_indices = GTensor(state_indices_mem, dtype=T.i32, shape=(-1,))
         output_gate = GTensor(output_gate_mem, dtype=T.bf16, shape=(-1,))
         norm_weight = GTensor(norm_weight_mem, dtype=T.bf16, shape=(-1,))
         out = GTensor(out_mem, dtype=T.bf16, shape=(-1,))
@@ -106,11 +110,13 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
         warp = tid // fx.Int32(_WARP_SIZE)
         lane_k = lane % fx.Int32(_WARP_THREADS_K)
 
-        state_idx = fx.Int32(state_indices[batch])
+        # Scalar load: the slot feeds the descriptor bases below, so it must
+        # land in an SGPR.
+        state_idx = fx.Int32(buf_scalar_load(ptr_buf_tensor(state_indices_mem), batch))
         valid = state_idx > fx.Int32(0)
         # Slot offsets exceed the 32-bit buffer voffset in the unified pool, so
         # each slot is folded into the 64-bit descriptor base instead.
-        slot = fx.Int64(fx.rocdl.readfirstlane(T.i32, state_idx))
+        slot = fx.Int64(state_idx)
         conv_state = GTensor(
             conv_state_mem,
             dtype=T.bf16,
