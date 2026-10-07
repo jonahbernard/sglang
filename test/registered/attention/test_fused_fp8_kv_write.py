@@ -2,6 +2,7 @@
 standard aiter FP8 path. Skipped on CPU (Triton requires a GPU)."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -170,6 +171,51 @@ class TestFusedFp8KvWrite(unittest.TestCase):
             "fused wrote into non-target V slots",
         )
 
+    def test_strided_cache_view(self):
+        """A cache view whose token stride exceeds num_heads * head_dim, as in a
+        unified pool's per-layer view, is written at its own strides at every
+        in-page offset, and no byte outside the target rows changes."""
+        from sglang.kernels.ops.attention.utils import (
+            launch_reshape_and_cache_flash,
+        )
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+        torch.manual_seed(0)
+        dev = "cuda"
+        heads, dim, page_size, num_slots, n = 2, 64, 16, 64, 24
+        row = heads * dim
+        # Each slot holds [K_0 | V_0 | K_1 | V_1]; the write targets layer 1.
+        buf = torch.zeros((num_slots, 4 * row), dtype=torch.uint8, device=dev)
+        ref = torch.zeros_like(buf)
+
+        def layer1_views(b):
+            return [
+                b[:, i * row : (i + 1) * row].view(fp8_dtype).view(-1, heads, dim)
+                for i in (2, 3)
+            ]
+
+        k = torch.randn((n, heads, dim), dtype=torch.bfloat16, device=dev)
+        v = torch.randn((n, heads, dim), dtype=torch.bfloat16, device=dev)
+        fp8_max = torch.finfo(fp8_dtype).max
+        k_scale = (k.abs().amax().float() / fp8_max).view(1)
+        v_scale = (v.abs().amax().float() / fp8_max).view(1)
+        loc = torch.randperm(num_slots, device=dev)[:n]
+
+        k_cache, v_cache = layer1_views(buf)
+        launch_reshape_and_cache_flash(
+            k,
+            v,
+            k_cache.view(-1, page_size, heads, dim),
+            v_cache.view(-1, page_size, heads, dim),
+            loc,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        k_ref, v_ref = layer1_views(ref)
+        k_ref[loc] = (k.float() / k_scale).to(fp8_dtype)
+        v_ref[loc] = (v.float() / v_scale).to(fp8_dtype)
+        self.assertTrue(torch.equal(buf, ref), "strided cache write mismatch")
+
 
 class _StopForward(Exception):
     """Short-circuit forward_* after the KV write to skip the attention math."""
@@ -192,6 +238,7 @@ class TestAiterFp8KvDispatch(unittest.TestCase):
         be.use_sliding_window_kv_pool = False
         be.use_mla = False
         be.page_size = 1
+        be.kv_index_translator = SimpleNamespace(is_translating=False)
 
         class _Meta:
             swa_out_cache_loc = None
