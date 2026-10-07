@@ -317,12 +317,13 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
 
 
 def _unified_swa_write_loc() -> Optional[torch.Tensor]:
-    """The aiter backend's per-batch swa write loc, or None when the active
-    backend does not build one."""
+    """The aiter or triton backend's per-batch swa write loc, or None when the
+    active backend does not build one."""
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
     backend = get_attn_backend()
-    if not isinstance(backend, AiterAttnBackend):
+    if not isinstance(backend, (AiterAttnBackend, TritonAttnBackend)):
         return None
     return backend.forward_metadata.swa_out_cache_loc
 
