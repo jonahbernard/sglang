@@ -311,18 +311,21 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         # need the backend's per-batch swa write loc.
         and (
             not isinstance(pool, UnifiedSWAKVPool)
-            or _unified_swa_write_loc() is not None
+            or _unified_swa_write_loc(forward_batch) is not None
         )
     )
 
 
-def _unified_swa_write_loc() -> Optional[torch.Tensor]:
+def _unified_swa_write_loc(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
     """The aiter or triton backend's per-batch swa write loc, or None when the
-    active backend does not build one."""
+    backend serving this forward does not build one."""
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
     from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
     backend = get_attn_backend()
+    if isinstance(backend, HybridAttnBackend):
+        backend = backend._select_backend(forward_batch.forward_mode)
     if not isinstance(backend, (AiterAttnBackend, TritonAttnBackend)):
         return None
     return backend.forward_metadata.swa_out_cache_loc
@@ -370,7 +373,9 @@ def create_fused_set_kv_buffer_arg(
             # This store bypasses the pool's physical-loc check on set_kv_buffer.
             assert forward_batch.out_cache_loc_is_physical
             if token_to_kv_pool.layers_mapping[layer_id][1]:
-                slot_mapping = _unified_swa_write_loc()[: slot_mapping.shape[0]]
+                slot_mapping = _unified_swa_write_loc(forward_batch)[
+                    : slot_mapping.shape[0]
+                ]
         # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
         # fused_qk_rope_reshape_and_cache via flash_layout=False. For the
         # legacy NHD 3D pool we reshape to the (num_blocks, page_size, H, D)
