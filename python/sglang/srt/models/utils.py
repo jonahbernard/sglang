@@ -304,21 +304,10 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         and not isinstance(pool, SWAKVPool)
         and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-    ) or (
-        _is_hip
-        and getattr(forward_batch, "dcp_kv_mask", None) is None
-        # The unified SWA pool has no full->swa slot table, so its SWA layers
-        # need the backend's per-batch swa write loc.
-        and (
-            not isinstance(pool, UnifiedSWAKVPool)
-            or _unified_swa_write_loc(forward_batch) is not None
-        )
-    )
+    ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
 
 
-def _unified_swa_write_loc(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
-    """The aiter or triton backend's per-batch swa write loc, or None when the
-    backend serving this forward does not build one."""
+def _unified_swa_write_loc(forward_batch: ForwardBatch) -> torch.Tensor:
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
     from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
     from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -326,8 +315,12 @@ def _unified_swa_write_loc(forward_batch: ForwardBatch) -> Optional[torch.Tensor
     backend = get_attn_backend()
     if isinstance(backend, HybridAttnBackend):
         backend = backend._select_backend(forward_batch.forward_mode)
-    if not isinstance(backend, (AiterAttnBackend, TritonAttnBackend)):
-        return None
+    # The unified SWA pool has no full->swa slot table, so the fused store
+    # needs the backend's per-batch swa write loc.
+    assert isinstance(backend, (AiterAttnBackend, TritonAttnBackend)), (
+        "unified SWA fused KV store needs an aiter or triton backend, "
+        f"got {type(backend).__name__}"
+    )
     return backend.forward_metadata.swa_out_cache_loc
 
 
