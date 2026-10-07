@@ -162,10 +162,8 @@ def reshape_and_cache_flash(
     swa_slot_mapping_ptr,
     k_scale_ptr,
     v_scale_ptr,
-    key_cache_block_stride,
-    key_cache_token_stride,
-    value_cache_block_stride,
-    value_cache_token_stride,
+    block_stride,
+    token_stride,
     key_stride,
     value_stride,
     num_heads,
@@ -202,10 +200,8 @@ def reshape_and_cache_flash(
         swa_slot_mapping_ptr: Optional second-stage slot remap for SWA mode.
         k_scale_ptr: Optional key scaling factor pointer.
         v_scale_ptr: Optional value scaling factor pointer.
-        key_cache_block_stride: Stride between key cache blocks.
-        key_cache_token_stride: Stride between key cache tokens within a block.
-        value_cache_block_stride: Stride between value cache blocks.
-        value_cache_token_stride: Stride between value cache tokens within a block.
+        block_stride: Stride between cache blocks.
+        token_stride: Stride between cache tokens within a block.
         key_stride: Stride between source key tokens.
         value_stride: Stride between source value tokens.
         num_heads: Number of attention heads.
@@ -278,21 +274,12 @@ def reshape_and_cache_flash(
     # target layout
     # [block_idx, block_offset, head, dim]
     # ----------------------------------
-    # Token strides come from the cache views, not num_heads * head_size: a
+    # The token stride comes from the cache view, not num_heads * head_size: a
     # unified pool's per-layer views stride each token by the whole entry.
-    tgt_key = (
-        block_idx * key_cache_block_stride
-        + block_offset * key_cache_token_stride
-        + offs
-    )
-    tgt_value = (
-        block_idx * value_cache_block_stride
-        + block_offset * value_cache_token_stride
-        + offs
-    )
+    tgt = block_idx * block_stride + block_offset * token_stride + offs
 
-    tl.store(key_cache_ptr + tgt_key, k, mask=mask)
-    tl.store(value_cache_ptr + tgt_value, v, mask=mask)
+    tl.store(key_cache_ptr + tgt, k, mask=mask)
+    tl.store(value_cache_ptr + tgt, v, mask=mask)
 
 
 def launch_reshape_and_cache_flash(
@@ -346,8 +333,6 @@ def launch_reshape_and_cache_flash(
         v_scale if v_scale is not None else key,
         key_cache.stride(0),
         key_cache.stride(1),
-        value_cache.stride(0),
-        value_cache.stride(1),
         key.stride(0),
         value.stride(0),
         num_heads,
